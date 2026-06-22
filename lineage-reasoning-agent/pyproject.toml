@@ -1,0 +1,26 @@
+[project]
+name = "lineage-reasoning-agent"
+version = "0.0.1"
+description = "Agent for reasoning over data lineage using Dataplex and Gemini."
+authors = [{ name = "Antigravity", email = "antigravity@google.com" }]
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "google-cloud-dataplex==2.14.0",
+    "vertexai==1.43.0",
+    "google-cloud-bigquery==3.20.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = "."
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -3,6 +3,8 @@ import csv
 import json
 import logging
 import os
+import shlex
+import subprocess
 import time
 from typing import Any
 
@@ -86,6 +88,80 @@ def generate_policy_code_from_gcs(query: str, gcs_uri: str) -> dict:
         return {"status": "error", "error_message": policy_code}
 
     return {"status": "success", "policy_code": policy_code}
+
+
+def _minimize_entry(entry: dict) -> dict:
+    """Extracts only the essential fields from a Dataplex entry for token efficiency."""
+    if not isinstance(entry, dict):
+        return entry
+
+    minimized = {
+        "entryType": entry.get("entryType"),
+        "fullyQualifiedName": entry.get("fullyQualifiedName"),
+    }
+
+    source = entry.get("entrySource")
+    if isinstance(source, dict):
+        minimized["entrySource"] = {
+            "displayName": source.get("displayName"),
+            "labels": source.get("labels"),
+        }
+
+    aspects = entry.get("aspects")
+    if isinstance(aspects, dict):
+        minimized_aspects = {}
+        for key, aspect in aspects.items():
+            if not isinstance(aspect, dict):
+                continue
+            aspect_type = aspect.get("aspectType", "")
+            if "schema" in aspect_type.lower():
+                data = aspect.get("data")
+                if isinstance(data, dict) and "fields" in data:
+                    minimized_fields = []
+                    for field in data["fields"]:
+                        if isinstance(field, dict):
+                            minimized_fields.append({
+                                "name": field.get("name"),
+                                "type": field.get("dataType") or field.get("type")
+                            })
+                    minimized_aspects[key] = {
+                        "aspectType": aspect_type,
+                        "data": {"fields": minimized_fields}
+                    }
+        if minimized_aspects:
+            minimized["aspects"] = minimized_aspects
+
+    return minimized
+
+
+def _enrich_violations_with_metadata(violations: list, metadata: list) -> list:
+    """Enriches violation dicts with their corresponding minimized resource metadata."""
+    if not violations or not metadata:
+        return violations
+
+    # Create a mapping from fullyQualifiedName/name to entry dict for O(1) lookup
+    metadata_map = {}
+    for entry in metadata:
+        if not isinstance(entry, dict):
+            continue
+        fqn = entry.get("fullyQualifiedName")
+        if fqn:
+            metadata_map[fqn] = entry
+        name = entry.get("name")
+        if name:
+            metadata_map[name] = entry
+
+    for v in violations:
+        if not isinstance(v, dict):
+            continue
+        # Skip if it already has metadata
+        if "resource_metadata" in v:
+            continue
+        res_name = v.get("resource_name")
+        if res_name and res_name in metadata_map:
+            v["resource_metadata"] = _minimize_entry(metadata_map[res_name])
+
+    return violations
 
 
 def _handle_policy_results(
@@ -201,6 +277,7 @@ def run_policy_from_gcs(
                 ]
 
             violations = run_simulation(policy_code, metadata)
+            violations = _enrich_violations_with_metadata(violations, metadata)
             for v in violations:
                 v["source_file"] = file_uri
             return violations
@@ -248,6 +325,7 @@ def run_policy_from_gcs(
             return {"status": "error", "error_message": metadata["error"]}
 
         violations = run_simulation(policy_code, metadata)
+        violations = _enrich_violations_with_metadata(violations, metadata)
 
         if violations and violations[0].get("policy") == "Configuration Error":
             if policy_id:
@@ -272,10 +350,61 @@ def run_policy_from_gcs(
         }
 
 
-def _get_remediation_with_retry(model, violation, max_retries=3):
-    """Gets a remediation suggestion for a single violation with exponential backoff."""
-    base_delay = 1
+def _parse_json_list(text: str) -> list:
+    """Safely extracts and parses a JSON list from LLM response text."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if text.lower().startswith("json\n"):
+        text = text[5:].strip()
+    return json.loads(text)
 
+
+def suggest_remediation(violations: list[dict[str, Any]] | str) -> dict:
+    """Suggests globally consistent remediation measures for a list of policy violations in a single LLM call."""
+    # 1. Parse string input if passed
+    if isinstance(violations, str):
+        try:
+            violations = json.loads(violations)
+        except json.JSONDecodeError as e:
+            return {
+                "status": "error",
+                "error_message": f"Error parsing violations JSON: {e}",
+            }
+
+    # 2. Convert single dict to list
+    if isinstance(violations, dict):
+        violations = [violations]
+
+    if not isinstance(violations, list):
+        return {
+            "status": "error",
+            "error_message": "violations must be a list of dictionaries.",
+        }
+
+    # 3. Sanitize and filter violations
+    filtered_violations = []
+    for v in violations:
+        if isinstance(v, str):
+            v = {"violation": v}
+        if isinstance(v, dict):
+            policy = v.get("policy", "")
+            if policy in ("Security Violation", "Execution Error", "Configuration Error", "Loading Error"):
+                continue
+            filtered_violations.append(v)
+
+    if not filtered_violations:
+        return {
+            "status": "success",
+            "remediation_suggestions": [],
+        }
+
+    # 4. Load prompt template
     try:
         prompt_path = os.path.join(
             script_dir, "prompts", PROMPT_REMEDIATION_FILE
@@ -284,72 +413,101 @@ def _get_remediation_with_retry(model, violation, max_retries=3):
             prompt_template = f.read()
     except FileNotFoundError:
         return {
-            "violation": violation,
-            "suggestion": "Error: Remediation prompt file not found.",
+            "status": "error",
+            "error_message": "Remediation prompt file not found.",
         }
 
-    for _ in range(max_retries):
-        try:
-            prompt = prompt_template.replace(
-                "{{VIOLATION_DETAILS}}", json.dumps(violation, indent=2)
-            )
-            response = model.generate_content(prompt)
-            return {"violation": violation, "suggestion": response.text.strip()}
-        except Exception as e:
-            logging.warning(
-                f"Error getting remediation for violation {violation.get('resource_name')}: {e}. Retrying in {base_delay} seconds..."
-            )
-            time.sleep(base_delay)
-            base_delay *= 2
-
-    logging.error(
-        f"Failed to get remediation for violation {violation.get('resource_name')} after {max_retries} retries."
+    prompt = prompt_template.replace(
+        "{{VIOLATIONS_LIST}}", json.dumps(filtered_violations, indent=2)
     )
-    return {
-        "violation": violation,
-        "suggestion": "Error: Could not generate a remediation suggestion.",
-    }
 
-
-def suggest_remediation(violations: list[dict[str, Any]]) -> dict:
-    """Suggests remediation measures for a list of policy violations concurrently."""
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         model = GenerativeModel(GEMINI_MODEL_FLASH)
+        
+        # Call the LLM in a single batch request
+        response = model.generate_content(prompt)
+        suggestions = _parse_json_list(response.text)
+        
+        return {
+            "status": "success",
+            "remediation_suggestions": suggestions,
+        }
     except Exception as e:
         return {
             "status": "error",
-            "error_message": f"Error initializing Vertex AI: {e}",
+            "error_message": f"Error generating remediation suggestions: {e}",
         }
 
-    remediation_suggestions = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=MAX_REMEDIATION_WORKERS
-    ) as executor:
-        future_to_violation = {
-            executor.submit(_get_remediation_with_retry, model, v): v
-            for v in violations
-        }
-        for future in concurrent.futures.as_completed(future_to_violation):
-            try:
-                suggestion = future.result()
-                remediation_suggestions.append(suggestion)
-            except Exception as exc:
-                violation = future_to_violation[future]
-                logging.error(
-                    f"An exception occurred while processing violation {violation.get('resource_name')}: {exc}"
-                )
-                remediation_suggestions.append(
-                    {
-                        "violation": violation,
-                        "suggestion": "Error: An unexpected exception occurred during remediation generation.",
-                    }
-                )
 
-    return {
-        "status": "success",
-        "remediation_suggestions": remediation_suggestions,
-    }
+def apply_remediation(command: str) -> dict:
+    """
+    Executes a Google Cloud CLI command (bq or gcloud) to apply a policy remediation fix.
+    This tool MUST only be run after the user has reviewed and explicitly approved the exact command.
+    
+    Args:
+        command (str): The exact command-line string to execute (e.g. `bq query ...` or `bq update ...`).
+        
+    Returns:
+        dict: A status dictionary containing 'status', and either 'output' or 'error_message'.
+    """
+    if not command:
+        return {"status": "error", "error_message": "Command is required."}
+
+    # Clean the command
+    command = command.strip().strip("`").strip()
+    if command.startswith("bash "):
+        command = command[5:].strip()
+
+    try:
+        args = shlex.split(command)
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to parse command: {e}",
+        }
+
+    if not args:
+        return {"status": "error", "error_message": "Command is empty."}
+
+    allowed_commands = {"bq", "gcloud"}
+    base_cmd = args[0].lower()
+    if base_cmd not in allowed_commands:
+        return {
+            "status": "error",
+            "error_message": f"Security violation: Command '{base_cmd}' is not allowed. Only 'bq' and 'gcloud' commands can be executed.",
+        }
+
+    try:
+        # Run the command with a 30-second timeout to prevent hanging
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        
+        if result.returncode == 0:
+            return {
+                "status": "success",
+                "output": result.stdout.strip() or "Command executed successfully with no output.",
+            }
+        else:
+            return {
+                "status": "error",
+                "error_message": result.stderr.strip() or f"Command failed with exit code {result.returncode}.",
+            }
+            
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "error_message": "Command execution timed out after 30 seconds.",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_message": f"Failed to execute command: {e}",
+        }
 
 
 def get_supported_examples() -> dict:
@@ -502,6 +660,7 @@ def run_policy_on_dataplex(
                 }
 
             violations = run_simulation(policy_code, metadata)
+            violations = _enrich_violations_with_metadata(violations, metadata)
 
             return _handle_policy_results(
                 violations, policy_id, version, "dataplex", len(metadata)
@@ -777,6 +936,7 @@ agent_tools = [
     run_policy_on_dataplex,
     get_supported_examples,
     suggest_remediation,
+    apply_remediation,
     get_execution_history,
     analyze_execution_history,
     generate_compliance_scorecard,

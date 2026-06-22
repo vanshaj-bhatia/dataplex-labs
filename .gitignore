@@ -355,3 +355,4 @@ MigrationBackup/
 # ADK
 session.db
 .venv/
+.env
